@@ -194,3 +194,20 @@ def test_write_predictions_creates_run_dir(tmp_path: Path) -> None:
     target = tmp_path / "nested" / "deeper"
     runs.write_predictions(target, [0], [1], [1], [0.9])
     assert (target / "predictions.csv").is_file()
+
+
+# -------- preprocessed_path -----------------------------------------------
+
+
+def test_preprocessed_path_respects_artifacts_root(artifacts_tmp: Path) -> None:
+    p = runs.preprocessed_path("train", "aggressive")
+    assert p == artifacts_tmp / "preprocessed" / "train__aggressive.parquet"
+
+
+def test_preprocessed_path_varies_by_split_and_mode(artifacts_tmp: Path) -> None:
+    assert runs.preprocessed_path("train", "raw") != runs.preprocessed_path(
+        "val", "raw"
+    )
+    assert runs.preprocessed_path("train", "raw") != runs.preprocessed_path(
+        "train", "aggressive"
+    )

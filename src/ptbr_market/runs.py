@@ -58,6 +58,15 @@ def runs_dir() -> Path:
     return artifacts_root() / "runs"
 
 
+def preprocessed_dir() -> Path:
+    return artifacts_root() / "preprocessed"
+
+
+def preprocessed_path(split_name: str, mode: str) -> Path:
+    """Caminho canônico do cache de pré-processamento para `(split, mode)`."""
+    return preprocessed_dir() / f"{split_name}__{mode}.parquet"
+
+
 def git_commit() -> str | None:
     try:
         result = subprocess.run(

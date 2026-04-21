@@ -230,3 +230,83 @@ def test_load_spacy_raises_useful_error_when_model_missing(
     with pytest.raises(RuntimeError, match="spacy download"):
         preprocessing._load_spacy()
     preprocessing._load_spacy.cache_clear()
+
+
+# -------- preprocess_split_cached -----------------------------------------
+
+
+@pytest.fixture
+def artifacts_tmp(
+    tmp_path: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> object:
+    """Isola `PTBR_ARTIFACTS_ROOT` em tmp_path (cache vai para tmp)."""
+    from pathlib import Path
+
+    root = Path(str(tmp_path))
+    monkeypatch.setenv("PTBR_ARTIFACTS_ROOT", str(root))
+    return root
+
+
+def test_preprocess_split_cached_raw_roundtrip(artifacts_tmp) -> None:
+    from ptbr_market import runs
+
+    out1 = preprocessing.preprocess_split_cached("train", "raw", [" A ", None, "b"])
+    assert out1 == ["A", "", "b"]
+    # Cache foi gravado:
+    assert runs.preprocessed_path("train", "raw").exists()
+    # Segunda chamada lê do cache:
+    out2 = preprocessing.preprocess_split_cached("train", "raw", [" A ", None, "b"])
+    assert out2 == out1
+
+
+def test_preprocess_split_cached_rejects_unknown_mode(artifacts_tmp) -> None:
+    with pytest.raises(ValueError, match="mode deve ser"):
+        preprocessing.preprocess_split_cached("train", "bogus", ["x"])
+
+
+def test_preprocess_split_cached_detects_length_mismatch(artifacts_tmp) -> None:
+    preprocessing.preprocess_split_cached("val", "raw", ["a", "b", "c"])
+    # Agora tento ler com tamanho diferente — deve falhar.
+    with pytest.raises(ValueError, match="force=True"):
+        preprocessing.preprocess_split_cached("val", "raw", ["a", "b"])
+
+
+def test_preprocess_split_cached_force_regenerates(artifacts_tmp) -> None:
+    preprocessing.preprocess_split_cached("val", "raw", ["a", "b"])
+    # Com force=True, recomputa com novos textos — aceita comprimento novo.
+    out = preprocessing.preprocess_split_cached(
+        "val", "raw", ["c", "d", "e"], force=True
+    )
+    assert out == ["c", "d", "e"]
+
+
+def test_preprocess_split_cached_separate_files_per_split_and_mode(
+    artifacts_tmp,
+) -> None:
+    from ptbr_market import runs
+
+    preprocessing.preprocess_split_cached("train", "raw", ["x"])
+    preprocessing.preprocess_split_cached("val", "raw", ["y"])
+    assert runs.preprocessed_path("train", "raw").exists()
+    assert runs.preprocessed_path("val", "raw").exists()
+    assert runs.preprocessed_path("train", "raw") != runs.preprocessed_path(
+        "val", "raw"
+    )
+    assert runs.preprocessed_path("train", "raw") != runs.preprocessed_path(
+        "train", "aggressive"
+    )
+
+
+@pytest.mark.slow
+def test_preprocess_split_cached_aggressive_roundtrip(
+    artifacts_tmp, skip_if_no_spacy_lg: None
+) -> None:
+    from ptbr_market import runs
+
+    texts = ["A Petrobras anunciou lucro recorde."]
+    out1 = preprocessing.preprocess_split_cached("train", "aggressive", texts)
+    assert "petrobras" in out1[0]
+    assert runs.preprocessed_path("train", "aggressive").exists()
+    # Segunda chamada não reexecuta SpaCy — lê direto do cache.
+    out2 = preprocessing.preprocess_split_cached("train", "aggressive", texts)
+    assert out2 == out1

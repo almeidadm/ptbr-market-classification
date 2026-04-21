@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
@@ -31,6 +31,8 @@ SPACY_MODEL = "pt_core_news_lg"
 
 MONEY_PLACEHOLDER = "[VALOR_MONETARIO]"
 PERCENT_PLACEHOLDER = "[PERCENTUAL]"
+
+ALLOWED_MODES: tuple[str, ...] = ("raw", "aggressive")
 
 _MONEY_RE = re.compile(
     r"(?:R\$|US\$|\$)\s*\d+(?:[.,]\d+)*"
@@ -137,3 +139,52 @@ def preprocess_aggressive(
         ]
         output.append(" ".join(tokens))
     return output
+
+
+def preprocess_split_cached(
+    split_name: str,
+    mode: str,
+    texts: Sequence[str | None],
+    *,
+    force: bool = False,
+) -> list[str]:
+    """Pré-processa `texts` para `(split_name, mode)` com cache em parquet.
+
+    Cache em `artifacts/preprocessed/{split_name}__{mode}.parquet` (coluna
+    única `text`). Se o cache existe e `force=False`, é lido direto; caso
+    contrário, `preprocess_raw` ou `preprocess_aggressive` é chamado
+    (dependendo de `mode`) e o resultado é persistido.
+
+    O comprimento do cache deve bater com `len(texts)` — um mismatch indica
+    que os splits mudaram e o cache está obsoleto; nesse caso, levanta
+    `ValueError` e o chamador deve passar `force=True`.
+    """
+    import pandas as pd  # import local — lazy para manter o módulo leve em imports
+
+    from ptbr_market import runs
+
+    if mode not in ALLOWED_MODES:
+        raise ValueError(
+            f"mode deve ser um de {ALLOWED_MODES}, recebido {mode!r}."
+        )
+
+    cache = runs.preprocessed_path(split_name, mode)
+    texts_list = list(texts)
+
+    if cache.exists() and not force:
+        df = pd.read_parquet(cache)
+        if len(df) != len(texts_list):
+            raise ValueError(
+                f"Cache {cache} tem {len(df)} linhas, mas {split_name!r} tem"
+                f" {len(texts_list)}. Splits mudaram — rode com force=True."
+            )
+        return df["text"].astype(str).tolist()
+
+    if mode == "aggressive":
+        result = preprocess_aggressive(texts_list)
+    else:  # "raw"
+        result = preprocess_raw(texts_list)
+
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"text": result}).to_parquet(cache, index=False)
+    return result
