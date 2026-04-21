@@ -9,6 +9,8 @@ __pycache__/
 
 # Run outputs are experiment-specific; splits are versioned.
 artifacts/runs/
+# Cache de textos pré-processados (regenerável a partir dos splits).
+artifacts/preprocessed/
 
 # Vetores fastText pré-treinados (~4,5 GB). Baixar conforme data/README.md.
 data/raw/cc.pt.300.*

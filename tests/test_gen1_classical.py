@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from lightgbm import LGBMClassifier
 from scipy.sparse import csr_matrix
 from sklearn.base import is_classifier
 from sklearn.calibration import CalibratedClassifierCV
@@ -30,7 +31,13 @@ def _toy_sparse_data(
 
 def test_gen1_classifiers_is_stable_tuple() -> None:
     assert isinstance(GEN1_CLASSIFIERS, tuple)
-    assert GEN1_CLASSIFIERS == ("linearsvc", "logreg", "multinomialnb", "complementnb")
+    assert GEN1_CLASSIFIERS == (
+        "linearsvc",
+        "logreg",
+        "multinomialnb",
+        "complementnb",
+        "lightgbm",
+    )
 
 
 def test_seed_constant_is_1() -> None:
@@ -58,6 +65,10 @@ def test_multinomialnb_has_expected_type() -> None:
 
 def test_complementnb_has_expected_type() -> None:
     assert isinstance(build_classifier("complementnb"), ComplementNB)
+
+
+def test_lightgbm_has_expected_type() -> None:
+    assert isinstance(build_classifier("lightgbm"), LGBMClassifier)
 
 
 @pytest.mark.parametrize("name", GEN1_CLASSIFIERS)
