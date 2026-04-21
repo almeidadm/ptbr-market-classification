@@ -58,3 +58,19 @@ def skip_if_no_real_corpus(real_corpus_available: bool) -> None:
 @pytest.fixture
 def real_data_root() -> Path:
     return runs.data_root()
+
+
+@pytest.fixture
+def skip_if_no_spacy_lg() -> None:
+    """Pula o teste se `pt_core_news_lg` não estiver instalado no ambiente atual."""
+    try:
+        import spacy
+    except ImportError:
+        pytest.skip("spacy não instalado.")
+    try:
+        spacy.load("pt_core_news_lg", disable=["parser", "ner"])
+    except OSError:
+        pytest.skip(
+            "Modelo SpaCy pt_core_news_lg não disponível;"
+            " rode `uv run python -m spacy download pt_core_news_lg`."
+        )
