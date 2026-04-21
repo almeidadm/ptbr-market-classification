@@ -1,0 +1,55 @@
+{
+  "generated_at": "2026-04-21T20:22:38+00:00",
+  "git_commit": null,
+  "partitions": {
+    "test": {
+      "path": "artifacts/splits/test.parquet",
+      "sha256": "fb618a211ef17a3c0b46f028d68b373c8f7ae646ac69419a36577bde47d08757"
+    },
+    "train": {
+      "path": "artifacts/splits/train.parquet",
+      "sha256": "cf88d781b26727b28815ed75ae4e5aa1b27824eee0474c9c6cd41ebb6053f125"
+    },
+    "val": {
+      "path": "artifacts/splits/val.parquet",
+      "sha256": "92a8305c6f0b287bfee890a75d6e616a8a02f4f4a3119f6b23fb296329ec538c"
+    }
+  },
+  "source_parquets": [
+    {
+      "name": "folhasp.parquet",
+      "sha256": "ddeddbb6c7d5f783d68dd641dc9763a32cc1b29839d7d7035fbeedcf930c979c"
+    }
+  ],
+  "split": {
+    "test": {
+      "n": 16627,
+      "pos_count": 2177,
+      "pos_ratio": 0.130932,
+      "window": [
+        "2017-05-24",
+        "2017-10-01"
+      ]
+    },
+    "tie_rule": "boundary_day_stays_in_older_partition",
+    "total_n": 167053,
+    "train": {
+      "n": 133725,
+      "pos_count": 16482,
+      "pos_ratio": 0.123253,
+      "window": [
+        "2015-01-01",
+        "2017-01-07"
+      ]
+    },
+    "val": {
+      "n": 16701,
+      "pos_count": 2311,
+      "pos_ratio": 0.138375,
+      "window": [
+        "2017-01-08",
+        "2017-05-23"
+      ]
+    }
+  }
+}

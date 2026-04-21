@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.ipynb_checkpoints/
+*.pyc
+
+# Run outputs are experiment-specific; splits are versioned.
+artifacts/runs/
+
+# Vetores fastText pré-treinados (~4,5 GB). Baixar conforme data/README.md.
+data/raw/cc.pt.300.*
