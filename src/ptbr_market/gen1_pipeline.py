@@ -37,6 +37,7 @@ from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
+from sklearn.preprocessing import LabelEncoder
 
 from ptbr_market import (
     evaluation,
@@ -326,13 +327,35 @@ def run_gen1_experiment(
                 "target_mode='multiclass' requer collapse_scheme (ex.:"
                 f" {tuple(COLLAPSE_SCHEMES)!r})."
             )
-        y_train_fit, num_classes = _derive_multiclass_labels(splits, collapse_scheme)
-        positive_class_label = POSITIVE_CATEGORY_LABEL
+        y_train_strings, num_classes = _derive_multiclass_labels(splits, collapse_scheme)
+        # XGBoost exige rótulos inteiros (`[0..K-1]`); os demais classificadores
+        # aceitam strings, mas padronizar em LabelEncoder evita divergência de
+        # ordenação de classes_ entre libs. O mapeamento fica no metadata.
+        encoder = LabelEncoder()
+        y_train_fit = encoder.fit_transform(y_train_strings)
+        if POSITIVE_CATEGORY_LABEL not in encoder.classes_:
+            raise ValueError(
+                f"Classe positiva {POSITIVE_CATEGORY_LABEL!r} ausente após"
+                f" encoding; classes encontradas: {list(encoder.classes_)!r}."
+            )
+        positive_class_label = int(
+            encoder.transform([POSITIVE_CATEGORY_LABEL])[0]
+        )
+        class_encoding = {
+            str(cls): int(code)
+            for cls, code in zip(
+                encoder.classes_,
+                encoder.transform(encoder.classes_),
+                strict=True,
+            )
+        }
         target_block = {
             "mode": "multiclass",
             "num_classes": num_classes,
             "positive_class_label": POSITIVE_CATEGORY_LABEL,
+            "positive_class_code": positive_class_label,
             "collapse_scheme": collapse_scheme,
+            "class_encoding": class_encoding,
         }
 
     y_val_binary = splits["val"]["label"].to_numpy()
