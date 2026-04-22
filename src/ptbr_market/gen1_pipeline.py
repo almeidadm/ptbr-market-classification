@@ -3,9 +3,12 @@
 Responsabilidades:
 
 - Aplicar o pré-processamento escolhido (`raw` ou `aggressive`) com cache.
-- Construir a representação (`tfidf` ou `bow`) ajustada **apenas no train**.
-- Para cada classificador listado: treinar, pontuar val/test, ajustar
-  _threshold_ no val (F1 da minoritária) e aplicá-lo no test.
+- Construir a representação (`tfidf`, `bow` ou `fasttext`) ajustada
+  **apenas no train**.
+- Para cada classificador listado: treinar (binário ou multiclasse),
+  pontuar val/test extraindo a probabilidade da classe `mercado`, ajustar
+  _threshold_ no val (F1 da minoritária sobre o rótulo binário) e
+  aplicá-lo no test.
 - Medir latência de inferência (ms por 1000 artigos, sobre o val).
 - Persistir o run em `artifacts/runs/{run_id}/` (metadata.json, metrics.json,
   predictions.csv).
@@ -13,6 +16,16 @@ Responsabilidades:
 Esta função é invocada tanto pelo script `scripts/run_gen1.py` (CLI)
 quanto por testes de integração — por isso recebe DataFrames já
 carregados em memória, não caminhos de parquet.
+
+Target modes
+------------
+- `binary` (default): treina com `splits[*]["label"]` ∈ {0,1}; a classe
+  positiva é `1` (mercado).
+- `multiclass`: decompõe a classe negativa (plano_base.md, seção
+  "Decomposição da Classe Negativa"). Treina com `splits[*]["category"]`
+  colapsada pelo `collapse_scheme`, e usa `predict_proba[:, idx("mercado")]`
+  como _score_ binário. Avaliação e _threshold_ continuam binários
+  (`label` ∈ {0,1}) — o alvo do paper não muda.
 """
 
 from __future__ import annotations
@@ -20,8 +33,9 @@ from __future__ import annotations
 import time
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
+import numpy as np
 import pandas as pd
 
 from ptbr_market import (
@@ -35,11 +49,74 @@ from ptbr_market import (
 
 REQUIRED_SPLITS: tuple[str, ...] = ("train", "val", "test")
 ALLOWED_REPRESENTATIONS: tuple[str, ...] = ("tfidf", "bow", "fasttext")
+ALLOWED_TARGET_MODES: tuple[str, ...] = ("binary", "multiclass")
 
 # Modelos que exigem features não-negativas — incompatíveis com médias
 # fastText (que produzem valores negativos).
 NON_NEGATIVE_ONLY_MODELS: tuple[str, ...] = ("multinomialnb", "complementnb")
 DENSE_NEGATIVE_REPRESENTATIONS: tuple[str, ...] = ("fasttext",)
+
+POSITIVE_CATEGORY_LABEL: str = "mercado"
+
+# Esquemas de colapso para `target_mode="multiclass"`. `keep` lista as
+# categorias mantidas como classes próprias; tudo fora cai em `sink`.
+# `mercado` precisa estar em `keep` (é a classe positiva avaliada).
+COLLAPSE_SCHEMES: dict[str, dict[str, Any]] = {
+    # Top-7 categorias do corpus FolhaSP (≈ 80.7% do train) + "outros".
+    # 8 classes no total. Ver plano_base.md seção sobre decomposição.
+    "top7_plus_other": {
+        "keep": (
+            "poder",
+            "colunas",
+            "mercado",
+            "esporte",
+            "mundo",
+            "cotidiano",
+            "ilustrada",
+        ),
+        "sink": "outros",
+    },
+}
+
+
+def _collapse_categories(categories: pd.Series, scheme: str) -> np.ndarray:
+    spec = COLLAPSE_SCHEMES[scheme]
+    keep = set(spec["keep"])
+    sink = spec["sink"]
+    return np.where(categories.isin(keep), categories.astype(object), sink).astype(
+        object
+    )
+
+
+def _derive_multiclass_labels(
+    splits: dict[str, pd.DataFrame],
+    scheme: str,
+) -> tuple[np.ndarray, int]:
+    """Deriva `y_multiclass_train` (strings) e conta as classes do esquema.
+
+    Só train recebe rótulos multiclasse — val/test usam o rótulo binário
+    original (via `splits[*]["label"]`) para threshold e avaliação.
+    """
+    if scheme not in COLLAPSE_SCHEMES:
+        raise ValueError(
+            f"collapse_scheme desconhecido: {scheme!r}. Use um de"
+            f" {tuple(COLLAPSE_SCHEMES)}."
+        )
+    spec = COLLAPSE_SCHEMES[scheme]
+    if POSITIVE_CATEGORY_LABEL not in spec["keep"]:
+        raise ValueError(
+            f"Esquema {scheme!r} não preserva a classe positiva"
+            f" {POSITIVE_CATEGORY_LABEL!r} em keep."
+        )
+    if "category" not in splits["train"].columns:
+        raise ValueError(
+            "splits['train'] precisa da coluna 'category' para"
+            " target_mode='multiclass'."
+        )
+
+    y_train = _collapse_categories(splits["train"]["category"], scheme)
+    num_classes = len(spec["keep"]) + 1  # +1 para o sink ("outros")
+    return y_train, num_classes
 
 
 def _preprocess_all(
@@ -111,14 +188,27 @@ def _measure_latency_ms_per_1k(clf: Any, X_val: Any) -> float:
     return elapsed_ms * 1000.0 / n
 
 
+def _positive_class_index(clf: Any, positive_class_label: Any) -> int:
+    classes = list(clf.classes_)
+    try:
+        return classes.index(positive_class_label)
+    except ValueError as exc:
+        raise ValueError(
+            f"Classe positiva {positive_class_label!r} não está em classes_"
+            f" do classificador: {classes!r}. Verifique se o collapse_scheme"
+            " preservou 'mercado' em train."
+        ) from exc
+
+
 def _run_one_model(
     name: str,
     X_train: Any,
     y_train: Any,
     X_val: Any,
-    y_val: Any,
+    y_val_binary: Any,
     X_test: Any,
-    y_test: Any,
+    y_test_binary: Any,
+    positive_class_label: Any,
     test_indices: list[int],
     variant: str,
     config: dict[str, Any],
@@ -128,13 +218,14 @@ def _run_one_model(
     clf = gen1_classical.build_classifier(name)
     clf.fit(X_train, y_train)
 
-    val_score = clf.predict_proba(X_val)[:, 1]
-    test_score = clf.predict_proba(X_test)[:, 1]
+    pos_idx = _positive_class_index(clf, positive_class_label)
+    val_score = clf.predict_proba(X_val)[:, pos_idx]
+    test_score = clf.predict_proba(X_test)[:, pos_idx]
 
-    decision = threshold.fit_threshold(y_val, val_score)
+    decision = threshold.fit_threshold(y_val_binary, val_score)
     y_pred_test = threshold.apply_threshold(test_score, decision)
 
-    metrics = evaluation.compute_metrics(y_test, test_score, y_pred_test)
+    metrics = evaluation.compute_metrics(y_test_binary, test_score, y_pred_test)
     latency = _measure_latency_ms_per_1k(clf, X_val)
     finished_at = runs.utc_now_iso()
 
@@ -142,7 +233,7 @@ def _run_one_model(
     runs.write_predictions(
         run_dir,
         indices=test_indices,
-        y_true=y_test.tolist(),
+        y_true=y_test_binary.tolist(),
         y_pred=y_pred_test.tolist(),
         y_score=test_score.tolist(),
     )
@@ -180,17 +271,25 @@ def run_gen1_experiment(
     representation: str = "tfidf",
     representation_params: dict[str, Any] | None = None,
     use_cache: bool = True,
+    target_mode: Literal["binary", "multiclass"] = "binary",
+    collapse_scheme: str | None = None,
 ) -> list[Path]:
     """Executa um experimento Gen 1 fim-a-fim e retorna os diretórios de run criados.
 
     `splits` deve conter chaves `"train"`, `"val"`, `"test"`, cada uma
-    apontando para um DataFrame com colunas `text` e `label` (e idealmente
-    `date`, mas não é exigida aqui — o metadata das janelas vem de
-    `split_meta_block`).
+    apontando para um DataFrame com colunas `text` e `label`. Para
+    `target_mode="multiclass"` também é exigida a coluna `category` em
+    `train`. Val/test usam apenas `label` (avaliação é sempre binária).
     """
     missing = [s for s in REQUIRED_SPLITS if s not in splits]
     if missing:
         raise ValueError(f"splits faltando: {missing!r}")
+
+    if target_mode not in ALLOWED_TARGET_MODES:
+        raise ValueError(
+            f"target_mode deve ser um de {ALLOWED_TARGET_MODES}, recebido"
+            f" {target_mode!r}."
+        )
 
     model_list = list(models)
     for m in model_list:
@@ -208,6 +307,37 @@ def run_gen1_experiment(
                 f" incompatível com {bad!r}. Use linearsvc ou logreg."
             )
 
+    if target_mode == "binary":
+        if collapse_scheme is not None:
+            raise ValueError(
+                "collapse_scheme só é usado quando target_mode='multiclass'."
+            )
+        y_train_fit = splits["train"]["label"].to_numpy()
+        positive_class_label: Any = 1
+        target_block: dict[str, Any] = {
+            "mode": "binary",
+            "num_classes": 2,
+            "positive_class_label": 1,
+            "collapse_scheme": None,
+        }
+    else:
+        if collapse_scheme is None:
+            raise ValueError(
+                "target_mode='multiclass' requer collapse_scheme (ex.:"
+                f" {tuple(COLLAPSE_SCHEMES)!r})."
+            )
+        y_train_fit, num_classes = _derive_multiclass_labels(splits, collapse_scheme)
+        positive_class_label = POSITIVE_CATEGORY_LABEL
+        target_block = {
+            "mode": "multiclass",
+            "num_classes": num_classes,
+            "positive_class_label": POSITIVE_CATEGORY_LABEL,
+            "collapse_scheme": collapse_scheme,
+        }
+
+    y_val_binary = splits["val"]["label"].to_numpy()
+    y_test_binary = splits["test"]["label"].to_numpy()
+
     texts = _preprocess_all(splits, preprocess_mode, force=not use_cache)
     X_train, X_val, X_test = _build_representation(
         representation,
@@ -217,16 +347,13 @@ def run_gen1_experiment(
         representation_params,
     )
 
-    y_train = splits["train"]["label"].to_numpy()
-    y_val = splits["val"]["label"].to_numpy()
-    y_test = splits["test"]["label"].to_numpy()
-
     config = {
         "seed": gen1_classical.SEED,
         "mask_entities": preprocess_mode == "aggressive",
         "preprocess": preprocess_mode,
         "representation": representation,
         "representation_params": representation_params or {},
+        "target": target_block,
     }
 
     run_dirs: list[Path] = []
@@ -234,11 +361,12 @@ def run_gen1_experiment(
         run_dir = _run_one_model(
             name,
             X_train,
-            y_train,
+            y_train_fit,
             X_val,
-            y_val,
+            y_val_binary,
             X_test,
-            y_test,
+            y_test_binary,
+            positive_class_label=positive_class_label,
             test_indices=splits["test"].index.tolist(),
             variant=variant,
             config=config,

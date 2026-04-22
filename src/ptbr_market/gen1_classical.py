@@ -13,6 +13,9 @@ fastText) já construídas fora deste módulo. Convenções:
   reprodução exata dentro da mesma versão do XGBoost.
 - `class_weight` fica em default (None). Balanceamento é escolha do
   experimento, não do builder.
+- `LogisticRegression` usa `lbfgs` (suporta binário e multiclasse — o
+  pipeline Gen 1 roda ambos). `liblinear` seria mais rápido em binário
+  mas não suporta multiclasse nativamente.
 """
 
 from __future__ import annotations
@@ -47,7 +50,7 @@ def build_classifier(name: str) -> ClassifierMixin:
         return CalibratedClassifierCV(base, method="sigmoid", cv=3)
     if name == "logreg":
         return LogisticRegression(
-            random_state=SEED, solver="liblinear", max_iter=1000
+            random_state=SEED, solver="lbfgs", max_iter=2000
         )
     if name == "multinomialnb":
         return MultinomialNB()

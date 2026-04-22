@@ -17,7 +17,13 @@ from ptbr_market.representations import FASTTEXT_DIM
 def tiny_market_splits() -> dict[str, pd.DataFrame]:
     """Corpus sintético com sinal claro: textos 'de mercado' contêm palavras-chave
     financeiras; textos 'outros' contêm vocabulário neutro. Tamanhos suficientes
-    para calibração 3-fold (≥ 3 positivos em cada split)."""
+    para calibração 3-fold (≥ 3 positivos em cada split).
+
+    Inclui a coluna `category` para permitir testes de target_mode=multiclass:
+    positivos recebem `mercado`; negativos são distribuídos em ciclo entre
+    `esporte`, `ilustrada`, `cotidiano` (todos em `top7_plus_other.keep`) e
+    `saude` (colapsa para `outros`).
+    """
     rng = np.random.default_rng(1)
     market_templates = [
         "a bolsa de valores fechou em alta forte hoje",
@@ -39,21 +45,27 @@ def tiny_market_splits() -> dict[str, pd.DataFrame]:
         "novela tem recorde de audiencia no horario",
         "partida teve placar apertado no segundo tempo",
     ]
+    neg_cycle = ("esporte", "ilustrada", "cotidiano", "saude")
 
     def make(n_pos: int, n_neg: int, date_offset: int) -> pd.DataFrame:
         texts: list[str] = []
         labels: list[int] = []
+        categories: list[str] = []
         dates: list[pd.Timestamp] = []
         for _ in range(n_pos):
             texts.append(rng.choice(market_templates))
             labels.append(1)
-        for _ in range(n_neg):
+            categories.append("mercado")
+        for i in range(n_neg):
             texts.append(rng.choice(other_templates))
             labels.append(0)
+            categories.append(neg_cycle[i % len(neg_cycle)])
         start = pd.Timestamp("2020-01-01") + pd.Timedelta(days=date_offset)
         for i in range(len(texts)):
             dates.append(start + pd.Timedelta(days=i))
-        df = pd.DataFrame({"text": texts, "label": labels, "date": dates})
+        df = pd.DataFrame(
+            {"text": texts, "label": labels, "category": categories, "date": dates}
+        )
         return df.reset_index(drop=True)
 
     return {
@@ -347,38 +359,254 @@ def test_run_gen1_experiment_produces_one_run_per_model(
     assert run_dirs[1].name.endswith("__multinomialnb__test")
 
 
+# -------- Target mode: multiclass -----------------------------------------
+
+
+def test_binary_mode_default_writes_target_block(
+    tiny_market_splits: dict[str, pd.DataFrame],
+    split_meta_block: dict,
+    isolated_artifacts: Path,
+) -> None:
+    run_dirs = gen1_pipeline.run_gen1_experiment(
+        splits=tiny_market_splits,
+        split_meta_block=split_meta_block,
+        models=["logreg"],
+        variant="test-binary",
+        preprocess_mode="raw",
+        representation_params={"min_df": 1, "max_df": 1.0},
+    )
+    meta = json.loads((run_dirs[0] / "metadata.json").read_text())
+    target = meta["config"]["target"]
+    assert target["mode"] == "binary"
+    assert target["num_classes"] == 2
+    assert target["positive_class_label"] == 1
+    assert target["collapse_scheme"] is None
+
+
+def test_multiclass_mode_top7_writes_expected_target_block(
+    tiny_market_splits: dict[str, pd.DataFrame],
+    split_meta_block: dict,
+    isolated_artifacts: Path,
+) -> None:
+    run_dirs = gen1_pipeline.run_gen1_experiment(
+        splits=tiny_market_splits,
+        split_meta_block=split_meta_block,
+        models=["logreg"],
+        variant="test-mc8",
+        preprocess_mode="raw",
+        representation_params={"min_df": 1, "max_df": 1.0},
+        target_mode="multiclass",
+        collapse_scheme="top7_plus_other",
+    )
+    meta = json.loads((run_dirs[0] / "metadata.json").read_text())
+    target = meta["config"]["target"]
+    assert target["mode"] == "multiclass"
+    assert target["num_classes"] == 8
+    assert target["positive_class_label"] == "mercado"
+    assert target["collapse_scheme"] == "top7_plus_other"
+
+
+def test_multiclass_predictions_remain_binary(
+    tiny_market_splits: dict[str, pd.DataFrame],
+    split_meta_block: dict,
+    isolated_artifacts: Path,
+) -> None:
+    """Em multiclass, y_true/y_pred no predictions.csv continuam binários
+    (0/1) porque avaliação é sempre contra `label`."""
+    run_dirs = gen1_pipeline.run_gen1_experiment(
+        splits=tiny_market_splits,
+        split_meta_block=split_meta_block,
+        models=["logreg"],
+        variant="test-mc8",
+        preprocess_mode="raw",
+        representation_params={"min_df": 1, "max_df": 1.0},
+        target_mode="multiclass",
+        collapse_scheme="top7_plus_other",
+    )
+    df = pd.read_csv(run_dirs[0] / "predictions.csv")
+    assert set(df["y_true"].unique()) <= {0, 1}
+    assert set(df["y_pred"].unique()) <= {0, 1}
+    assert (df["y_score"] >= 0.0).all() and (df["y_score"] <= 1.0).all()
+
+
+def test_multiclass_learns_some_signal(
+    tiny_market_splits: dict[str, pd.DataFrame],
+    split_meta_block: dict,
+    isolated_artifacts: Path,
+) -> None:
+    run_dirs = gen1_pipeline.run_gen1_experiment(
+        splits=tiny_market_splits,
+        split_meta_block=split_meta_block,
+        models=["logreg"],
+        variant="test-mc8",
+        preprocess_mode="raw",
+        representation_params={"min_df": 1, "max_df": 1.0},
+        target_mode="multiclass",
+        collapse_scheme="top7_plus_other",
+    )
+    metrics = json.loads((run_dirs[0] / "metrics.json").read_text())
+    assert metrics["pr_auc"] > 0.6, metrics
+
+
+def test_multiclass_rejects_missing_scheme(
+    tiny_market_splits: dict[str, pd.DataFrame],
+    split_meta_block: dict,
+    isolated_artifacts: Path,
+) -> None:
+    with pytest.raises(ValueError, match="collapse_scheme"):
+        gen1_pipeline.run_gen1_experiment(
+            splits=tiny_market_splits,
+            split_meta_block=split_meta_block,
+            models=["logreg"],
+            variant="test",
+            preprocess_mode="raw",
+            target_mode="multiclass",
+        )
+
+
+def test_binary_rejects_collapse_scheme(
+    tiny_market_splits: dict[str, pd.DataFrame],
+    split_meta_block: dict,
+    isolated_artifacts: Path,
+) -> None:
+    with pytest.raises(ValueError, match="collapse_scheme só é usado"):
+        gen1_pipeline.run_gen1_experiment(
+            splits=tiny_market_splits,
+            split_meta_block=split_meta_block,
+            models=["logreg"],
+            variant="test",
+            preprocess_mode="raw",
+            target_mode="binary",
+            collapse_scheme="top7_plus_other",
+        )
+
+
+def test_multiclass_rejects_unknown_scheme(
+    tiny_market_splits: dict[str, pd.DataFrame],
+    split_meta_block: dict,
+    isolated_artifacts: Path,
+) -> None:
+    with pytest.raises(ValueError, match="collapse_scheme desconhecido"):
+        gen1_pipeline.run_gen1_experiment(
+            splits=tiny_market_splits,
+            split_meta_block=split_meta_block,
+            models=["logreg"],
+            variant="test",
+            preprocess_mode="raw",
+            target_mode="multiclass",
+            collapse_scheme="not_a_scheme",
+        )
+
+
+def test_multiclass_rejects_missing_category_column(
+    tiny_market_splits: dict[str, pd.DataFrame],
+    split_meta_block: dict,
+    isolated_artifacts: Path,
+) -> None:
+    splits = {k: v.drop(columns=["category"]) for k, v in tiny_market_splits.items()}
+    with pytest.raises(ValueError, match="precisa da coluna 'category'"):
+        gen1_pipeline.run_gen1_experiment(
+            splits=splits,
+            split_meta_block=split_meta_block,
+            models=["logreg"],
+            variant="test",
+            preprocess_mode="raw",
+            target_mode="multiclass",
+            collapse_scheme="top7_plus_other",
+        )
+
+
+def test_rejects_unknown_target_mode(
+    tiny_market_splits: dict[str, pd.DataFrame],
+    split_meta_block: dict,
+    isolated_artifacts: Path,
+) -> None:
+    with pytest.raises(ValueError, match="target_mode"):
+        gen1_pipeline.run_gen1_experiment(
+            splits=tiny_market_splits,
+            split_meta_block=split_meta_block,
+            models=["logreg"],
+            variant="test",
+            preprocess_mode="raw",
+            target_mode="triclass",  # type: ignore[arg-type]
+        )
+
+
 # -------- CLI smoke tests --------------------------------------------------
+
+
+def _load_run_gen1_module():
+    import importlib.util
+
+    script_path = Path(__file__).parent.parent / "scripts" / "run_gen1.py"
+    spec = importlib.util.spec_from_file_location("run_gen1", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_script_parse_args_defaults_match_expected() -> None:
     """Smoke test do script CLI: defaults batem com as constantes."""
-    import importlib.util
-
-    script_path = Path(__file__).parent.parent / "scripts" / "run_gen1.py"
-    spec = importlib.util.spec_from_file_location("run_gen1", script_path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-
+    module = _load_run_gen1_module()
     args = module.parse_args([])
-    assert args.variant == module.DEFAULT_VARIANT
+    assert args.variant == module.DEFAULT_VARIANT  # None = auto-deriva
     assert args.representation == module.DEFAULT_REPRESENTATION
     assert args.preprocess_mode == module.DEFAULT_MODE
+    assert args.target_mode == module.DEFAULT_TARGET_MODE
+    assert args.collapse_scheme is None
     assert args.no_cache is False
 
 
 def test_script_parse_args_honors_overrides() -> None:
-    import importlib.util
-
-    script_path = Path(__file__).parent.parent / "scripts" / "run_gen1.py"
-    spec = importlib.util.spec_from_file_location("run_gen1", script_path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-
+    module = _load_run_gen1_module()
     args = module.parse_args(
         ["--models", "logreg", "--variant", "v1", "--no-cache"]
     )
     assert args.models == "logreg"
     assert args.variant == "v1"
     assert args.no_cache is True
+
+
+def test_script_parse_args_multiclass_flags() -> None:
+    module = _load_run_gen1_module()
+    args = module.parse_args(
+        ["--target-mode", "multiclass", "--collapse-scheme", "top7_plus_other"]
+    )
+    assert args.target_mode == "multiclass"
+    assert args.collapse_scheme == "top7_plus_other"
+
+
+def test_script_derive_variant_binary() -> None:
+    module = _load_run_gen1_module()
+    assert module._derive_variant("tfidf", "aggressive", "binary", None) == "tfidf-aggr-bin"
+    assert module._derive_variant("bow", "raw", "binary", None) == "bow-raw-bin"
+
+
+def test_script_derive_variant_multiclass() -> None:
+    module = _load_run_gen1_module()
+    # top7_plus_other: 7 keep + 1 sink = 8 classes → mc8
+    assert (
+        module._derive_variant("fasttext", "aggressive", "multiclass", "top7_plus_other")
+        == "fasttext-aggr-mc8"
+    )
+
+
+def test_script_main_rejects_multiclass_without_scheme(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _load_run_gen1_module()
+    rc = module.main(["--target-mode", "multiclass"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "--collapse-scheme" in err
+
+
+def test_script_main_rejects_scheme_without_multiclass(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _load_run_gen1_module()
+    rc = module.main(["--collapse-scheme", "top7_plus_other"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "multiclass" in err
