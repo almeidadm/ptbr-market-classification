@@ -299,10 +299,16 @@ def run_gen2_experiment(
     # quando o número de classes diverge — necessário para modelos como
     # FinBERT-PT-BR (pretreinado em sentimento 3-classes). O encoder
     # permanece intacto; só o classifier head é reinicializado.
+    # problem_type="single_label_classification" força CrossEntropyLoss
+    # mesmo quando o config.json do checkpoint original declara
+    # "multi_label_classification" (caso do FinBERT-PT-BR). Sem isso o
+    # Trainer chama BCEWithLogitsLoss e falha com shape mismatch entre
+    # logits (N, C) e labels (N,).
     model = AutoModelForSequenceClassification.from_pretrained(
         spec.hf_id,
         num_labels=num_labels,
         ignore_mismatched_sizes=True,
+        problem_type="single_label_classification",
     )
 
     train_ds = _TextDataset(train_texts, y_train_fit.tolist(), tokenizer, max_length)
