@@ -295,8 +295,14 @@ def run_gen2_experiment(
         }
 
     tokenizer = AutoTokenizer.from_pretrained(spec.hf_id)
+    # ignore_mismatched_sizes=True descarta cabeças de tarefa anterior
+    # quando o número de classes diverge — necessário para modelos como
+    # FinBERT-PT-BR (pretreinado em sentimento 3-classes). O encoder
+    # permanece intacto; só o classifier head é reinicializado.
     model = AutoModelForSequenceClassification.from_pretrained(
-        spec.hf_id, num_labels=num_labels
+        spec.hf_id,
+        num_labels=num_labels,
+        ignore_mismatched_sizes=True,
     )
 
     train_ds = _TextDataset(train_texts, y_train_fit.tolist(), tokenizer, max_length)
