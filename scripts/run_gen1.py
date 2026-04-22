@@ -23,7 +23,7 @@ import argparse
 import json
 import sys
 
-from ptbr_market import gen1_classical, gen1_pipeline, preprocessing, runs
+from ptbr_market import gen1_classical, gen1_pipeline, preprocessing, runs, targets
 
 DEFAULT_VARIANT: str | None = None  # None = auto-deriva
 DEFAULT_MODE = "aggressive"
@@ -40,12 +40,7 @@ def _derive_variant(
     collapse_scheme: str | None,
 ) -> str:
     preproc_short = _PREPROC_SHORT.get(preprocess_mode, preprocess_mode)
-    if target_mode == "binary":
-        target_short = "bin"
-    else:
-        spec = gen1_pipeline.COLLAPSE_SCHEMES[collapse_scheme]
-        k = len(spec["keep"]) + 1
-        target_short = f"mc{k}"
+    target_short = targets.target_variant_tag(target_mode, collapse_scheme)
     return f"{representation}-{preproc_short}-{target_short}"
 
 
@@ -84,7 +79,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--target-mode",
         default=DEFAULT_TARGET_MODE,
-        choices=gen1_pipeline.ALLOWED_TARGET_MODES,
+        choices=targets.ALLOWED_TARGET_MODES,
         help=(
             "`binary` (default): treina com label ∈ {0,1}."
             " `multiclass`: decompõe a classe negativa via --collapse-scheme,"
@@ -94,7 +89,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--collapse-scheme",
         default=None,
-        choices=tuple(gen1_pipeline.COLLAPSE_SCHEMES),
+        choices=tuple(targets.COLLAPSE_SCHEMES),
         help="Esquema de colapso para target-mode=multiclass.",
     )
     parser.add_argument(

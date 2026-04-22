@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from ptbr_market import gen2_bert, runs
+from ptbr_market import gen2_bert, runs, targets
 
 TINY_MODEL_ID = "hf-internal-testing/tiny-random-bert"
 
@@ -151,7 +151,7 @@ def test_run_gen2_experiment_metadata_schema(
         assert key in meta, f"metadata faltando chave obrigatória {key!r}"
     assert meta["generation"] == "gen2"
     assert meta["model"] == registered_tiny_model
-    assert meta["variant"] == "raw-ml32"
+    assert meta["variant"] == "raw-ml32-bin"
     assert meta["config"]["preprocess"] == "raw"
     assert meta["config"]["mask_entities"] is False
     assert meta["config"]["target"]["mode"] == "binary"
@@ -219,4 +219,124 @@ def test_run_gen2_variant_autoderives_from_max_length(
         epochs=1,
         batch_size=2,
     )
-    assert f"__gen2__{registered_tiny_model}__raw-ml16" in run_dir.name
+    assert f"__gen2__{registered_tiny_model}__raw-ml16-bin" in run_dir.name
+
+
+@pytest.fixture
+def tiny_multiclass_splits(
+    tiny_binary_splits: dict[str, pd.DataFrame],
+) -> dict[str, pd.DataFrame]:
+    """Enriquece o fixture binário com `category` para exercitar mc8.
+
+    Train recebe categorias do `keep` do top7_plus_other (mercado para
+    positivos, outras categorias para negativos — inclui um sink "outros"
+    para exercitar a rota do colapso). Val/test permanecem binários.
+    """
+    keep_negs = ["poder", "colunas", "esporte", "mundo", "cotidiano"]
+
+    def attach_category(df: pd.DataFrame) -> pd.DataFrame:
+        cats: list[str] = []
+        neg_i = 0
+        for label in df["label"].tolist():
+            if label == 1:
+                cats.append("mercado")
+            else:
+                cats.append(keep_negs[neg_i % len(keep_negs)])
+                neg_i += 1
+        out = df.copy()
+        out["category"] = cats
+        return out
+
+    return {
+        "train": attach_category(tiny_binary_splits["train"]),
+        "val": tiny_binary_splits["val"],
+        "test": tiny_binary_splits["test"],
+    }
+
+
+@pytest.mark.slow
+def test_run_gen2_multiclass_writes_target_block(
+    tiny_multiclass_splits: dict[str, pd.DataFrame],
+    split_meta_block: dict,
+    isolated_artifacts: Path,
+    registered_tiny_model: str,
+) -> None:
+    run_dir = gen2_bert.run_gen2_experiment(
+        splits=tiny_multiclass_splits,
+        split_meta_block=split_meta_block,
+        model_slug=registered_tiny_model,
+        max_length=16,
+        epochs=1,
+        batch_size=2,
+        target_mode="multiclass",
+        collapse_scheme="top7_plus_other",
+    )
+    assert f"__gen2__{registered_tiny_model}__raw-ml16-mc8" in run_dir.name
+    meta = json.loads((run_dir / "metadata.json").read_text())
+    tgt = meta["config"]["target"]
+    assert tgt["mode"] == "multiclass"
+    assert tgt["num_classes"] == 8
+    assert tgt["positive_class_label"] == targets.POSITIVE_CATEGORY_LABEL
+    assert tgt["collapse_scheme"] == "top7_plus_other"
+    assert "positive_class_code" in tgt
+    assert tgt["class_encoding"][targets.POSITIVE_CATEGORY_LABEL] == tgt[
+        "positive_class_code"
+    ]
+
+
+@pytest.mark.slow
+def test_run_gen2_multiclass_predictions_remain_binary(
+    tiny_multiclass_splits: dict[str, pd.DataFrame],
+    split_meta_block: dict,
+    isolated_artifacts: Path,
+    registered_tiny_model: str,
+) -> None:
+    run_dir = gen2_bert.run_gen2_experiment(
+        splits=tiny_multiclass_splits,
+        split_meta_block=split_meta_block,
+        model_slug=registered_tiny_model,
+        max_length=16,
+        epochs=1,
+        batch_size=2,
+        target_mode="multiclass",
+        collapse_scheme="top7_plus_other",
+    )
+    preds = pd.read_csv(run_dir / "predictions.csv")
+    assert preds["y_pred"].isin([0, 1]).all()
+    assert preds["y_true"].isin([0, 1]).all()
+    assert ((preds["y_score"] >= 0) & (preds["y_score"] <= 1)).all()
+    np.testing.assert_array_equal(
+        preds["y_true"].to_numpy(),
+        tiny_multiclass_splits["test"]["label"].to_numpy(),
+    )
+
+
+def test_run_gen2_multiclass_requires_collapse_scheme(
+    tiny_multiclass_splits: dict[str, pd.DataFrame],
+    split_meta_block: dict,
+    isolated_artifacts: Path,
+    registered_tiny_model: str,
+) -> None:
+    with pytest.raises(ValueError, match="requer collapse_scheme"):
+        gen2_bert.run_gen2_experiment(
+            splits=tiny_multiclass_splits,
+            split_meta_block=split_meta_block,
+            model_slug=registered_tiny_model,
+            target_mode="multiclass",
+        )
+
+
+def test_run_gen2_binary_rejects_collapse_scheme(
+    tiny_binary_splits: dict[str, pd.DataFrame],
+    split_meta_block: dict,
+    isolated_artifacts: Path,
+    registered_tiny_model: str,
+) -> None:
+    with pytest.raises(ValueError, match="só é usado quando target_mode"):
+        gen2_bert.run_gen2_experiment(
+            splits=tiny_binary_splits,
+            split_meta_block=split_meta_block,
+            model_slug=registered_tiny_model,
+            target_mode="binary",
+            collapse_scheme="top7_plus_other",
+        )

@@ -35,9 +35,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Literal
 
-import numpy as np
 import pandas as pd
-from sklearn.preprocessing import LabelEncoder
 
 from ptbr_market import (
     evaluation,
@@ -45,79 +43,17 @@ from ptbr_market import (
     preprocessing,
     representations,
     runs,
+    targets,
     threshold,
 )
 
 REQUIRED_SPLITS: tuple[str, ...] = ("train", "val", "test")
 ALLOWED_REPRESENTATIONS: tuple[str, ...] = ("tfidf", "bow", "fasttext")
-ALLOWED_TARGET_MODES: tuple[str, ...] = ("binary", "multiclass")
 
 # Modelos que exigem features não-negativas — incompatíveis com médias
 # fastText (que produzem valores negativos).
 NON_NEGATIVE_ONLY_MODELS: tuple[str, ...] = ("multinomialnb", "complementnb")
 DENSE_NEGATIVE_REPRESENTATIONS: tuple[str, ...] = ("fasttext",)
-
-POSITIVE_CATEGORY_LABEL: str = "mercado"
-
-# Esquemas de colapso para `target_mode="multiclass"`. `keep` lista as
-# categorias mantidas como classes próprias; tudo fora cai em `sink`.
-# `mercado` precisa estar em `keep` (é a classe positiva avaliada).
-COLLAPSE_SCHEMES: dict[str, dict[str, Any]] = {
-    # Top-7 categorias do corpus FolhaSP (≈ 80.7% do train) + "outros".
-    # 8 classes no total. Ver plano_base.md seção sobre decomposição.
-    "top7_plus_other": {
-        "keep": (
-            "poder",
-            "colunas",
-            "mercado",
-            "esporte",
-            "mundo",
-            "cotidiano",
-            "ilustrada",
-        ),
-        "sink": "outros",
-    },
-}
-
-
-def _collapse_categories(categories: pd.Series, scheme: str) -> np.ndarray:
-    spec = COLLAPSE_SCHEMES[scheme]
-    keep = set(spec["keep"])
-    sink = spec["sink"]
-    return np.where(categories.isin(keep), categories.astype(object), sink).astype(
-        object
-    )
-
-
-def _derive_multiclass_labels(
-    splits: dict[str, pd.DataFrame],
-    scheme: str,
-) -> tuple[np.ndarray, int]:
-    """Deriva `y_multiclass_train` (strings) e conta as classes do esquema.
-
-    Só train recebe rótulos multiclasse — val/test usam o rótulo binário
-    original (via `splits[*]["label"]`) para threshold e avaliação.
-    """
-    if scheme not in COLLAPSE_SCHEMES:
-        raise ValueError(
-            f"collapse_scheme desconhecido: {scheme!r}. Use um de"
-            f" {tuple(COLLAPSE_SCHEMES)}."
-        )
-    spec = COLLAPSE_SCHEMES[scheme]
-    if POSITIVE_CATEGORY_LABEL not in spec["keep"]:
-        raise ValueError(
-            f"Esquema {scheme!r} não preserva a classe positiva"
-            f" {POSITIVE_CATEGORY_LABEL!r} em keep."
-        )
-    if "category" not in splits["train"].columns:
-        raise ValueError(
-            "splits['train'] precisa da coluna 'category' para"
-            " target_mode='multiclass'."
-        )
-
-    y_train = _collapse_categories(splits["train"]["category"], scheme)
-    num_classes = len(spec["keep"]) + 1  # +1 para o sink ("outros")
-    return y_train, num_classes
 
 
 def _preprocess_all(
@@ -286,10 +222,10 @@ def run_gen1_experiment(
     if missing:
         raise ValueError(f"splits faltando: {missing!r}")
 
-    if target_mode not in ALLOWED_TARGET_MODES:
+    if target_mode not in targets.ALLOWED_TARGET_MODES:
         raise ValueError(
-            f"target_mode deve ser um de {ALLOWED_TARGET_MODES}, recebido"
-            f" {target_mode!r}."
+            f"target_mode deve ser um de {targets.ALLOWED_TARGET_MODES},"
+            f" recebido {target_mode!r}."
         )
 
     model_list = list(models)
@@ -325,35 +261,20 @@ def run_gen1_experiment(
         if collapse_scheme is None:
             raise ValueError(
                 "target_mode='multiclass' requer collapse_scheme (ex.:"
-                f" {tuple(COLLAPSE_SCHEMES)!r})."
+                f" {tuple(targets.COLLAPSE_SCHEMES)!r})."
             )
-        y_train_strings, num_classes = _derive_multiclass_labels(splits, collapse_scheme)
-        # XGBoost exige rótulos inteiros (`[0..K-1]`); os demais classificadores
-        # aceitam strings, mas padronizar em LabelEncoder evita divergência de
-        # ordenação de classes_ entre libs. O mapeamento fica no metadata.
-        encoder = LabelEncoder()
-        y_train_fit = encoder.fit_transform(y_train_strings)
-        if POSITIVE_CATEGORY_LABEL not in encoder.classes_:
-            raise ValueError(
-                f"Classe positiva {POSITIVE_CATEGORY_LABEL!r} ausente após"
-                f" encoding; classes encontradas: {list(encoder.classes_)!r}."
-            )
-        positive_class_label = int(
-            encoder.transform([POSITIVE_CATEGORY_LABEL])[0]
+        y_train_strings, num_classes = targets.derive_multiclass_labels(
+            splits, collapse_scheme
         )
-        class_encoding = {
-            str(cls): int(code)
-            for cls, code in zip(
-                encoder.classes_,
-                encoder.transform(encoder.classes_),
-                strict=True,
-            )
-        }
+        y_train_fit, positive_class_code, class_encoding = targets.encode_multiclass(
+            y_train_strings
+        )
+        positive_class_label = positive_class_code
         target_block = {
             "mode": "multiclass",
             "num_classes": num_classes,
-            "positive_class_label": POSITIVE_CATEGORY_LABEL,
-            "positive_class_code": positive_class_label,
+            "positive_class_label": targets.POSITIVE_CATEGORY_LABEL,
+            "positive_class_code": positive_class_code,
             "collapse_scheme": collapse_scheme,
             "class_encoding": class_encoding,
         }
