@@ -87,9 +87,11 @@ def test_build_bow_returns_count_matrix() -> None:
     vec, X = build_bow(TRAIN_TEXTS, min_df=1, max_df=1.0)
     assert issparse(X)
     assert X.shape[0] == len(TRAIN_TEXTS)
-    # Contagens são inteiros não-negativos.
+    # Contagens são inteiros não-negativos, armazenadas em float32 para
+    # compatibilidade com LightGBM/XGBoost (que exigem float).
     assert X.min() >= 0
-    assert np.issubdtype(X.dtype, np.integer)
+    assert X.dtype == np.float32
+    np.testing.assert_array_equal(X.data, X.data.astype(np.int64).astype(np.float32))
 
 
 def test_build_bow_default_ngram_is_1_1() -> None:

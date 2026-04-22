@@ -42,6 +42,7 @@ BOW_DEFAULTS: dict[str, Any] = {
     "ngram_range": (1, 1),
     "min_df": 5,
     "max_df": 0.95,
+    "dtype": np.float32,
 }
 
 

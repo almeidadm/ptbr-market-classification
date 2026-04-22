@@ -203,7 +203,7 @@ def test_run_gen1_experiment_rejects_unknown_model(
         gen1_pipeline.run_gen1_experiment(
             splits=tiny_market_splits,
             split_meta_block=split_meta_block,
-            models=["xgboost"],
+            models=["catboost"],
             variant="test",
             preprocess_mode="raw",
         )

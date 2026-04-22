@@ -9,6 +9,8 @@ fastText) já construídas fora deste módulo. Convenções:
   opera na grade [0.05, 0.95] de probabilidades.
 - `LGBMClassifier` roda em modo determinístico (`deterministic=True`,
   `force_col_wise=True`) para que o `random_state` baste para reprodução.
+- `XGBClassifier` usa `tree_method="hist"` com `n_jobs=1` para garantir
+  reprodução exata dentro da mesma versão do XGBoost.
 - `class_weight` fica em default (None). Balanceamento é escolha do
   experimento, não do builder.
 """
@@ -21,6 +23,7 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import LogisticRegression
 from sklearn.naive_bayes import ComplementNB, MultinomialNB
 from sklearn.svm import LinearSVC
+from xgboost import XGBClassifier
 
 SEED = 1
 
@@ -30,6 +33,7 @@ GEN1_CLASSIFIERS: tuple[str, ...] = (
     "multinomialnb",
     "complementnb",
     "lightgbm",
+    "xgboost",
 )
 
 
@@ -39,7 +43,7 @@ def build_classifier(name: str) -> ClassifierMixin:
     Nomes aceitos em `GEN1_CLASSIFIERS`.
     """
     if name == "linearsvc":
-        base = LinearSVC(random_state=SEED, dual="auto")
+        base = LinearSVC(random_state=SEED, dual="auto", max_iter=5000)
         return CalibratedClassifierCV(base, method="sigmoid", cv=3)
     if name == "logreg":
         return LogisticRegression(
@@ -55,6 +59,14 @@ def build_classifier(name: str) -> ClassifierMixin:
             deterministic=True,
             force_col_wise=True,
             verbose=-1,
+        )
+    if name == "xgboost":
+        return XGBClassifier(
+            random_state=SEED,
+            tree_method="hist",
+            n_jobs=1,
+            verbosity=0,
+            eval_metric="logloss",
         )
     raise ValueError(
         f"Classificador desconhecido: {name!r}. Use um de {GEN1_CLASSIFIERS}."
