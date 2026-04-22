@@ -412,29 +412,6 @@ def test_multiclass_mode_top7_writes_expected_target_block(
     assert target["positive_class_code"] == target["class_encoding"]["mercado"]
 
 
-def test_multiclass_works_with_xgboost(
-    tiny_market_splits: dict[str, pd.DataFrame],
-    split_meta_block: dict,
-    isolated_artifacts: Path,
-) -> None:
-    """Regressão: XGBoost rejeita labels string, então o pipeline precisa
-    aplicar LabelEncoder antes de fit."""
-    run_dirs = gen1_pipeline.run_gen1_experiment(
-        splits=tiny_market_splits,
-        split_meta_block=split_meta_block,
-        models=["xgboost"],
-        variant="test-mc8-xgb",
-        preprocess_mode="raw",
-        representation_params={"min_df": 1, "max_df": 1.0},
-        target_mode="multiclass",
-        collapse_scheme="top7_plus_other",
-    )
-    assert len(run_dirs) == 1
-    df = pd.read_csv(run_dirs[0] / "predictions.csv")
-    assert set(df["y_true"].unique()) <= {0, 1}
-    assert set(df["y_pred"].unique()) <= {0, 1}
-
-
 def test_multiclass_predictions_remain_binary(
     tiny_market_splits: dict[str, pd.DataFrame],
     split_meta_block: dict,

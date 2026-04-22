@@ -9,8 +9,11 @@ fastText) já construídas fora deste módulo. Convenções:
   opera na grade [0.05, 0.95] de probabilidades.
 - `LGBMClassifier` roda em modo determinístico (`deterministic=True`,
   `force_col_wise=True`) para que o `random_state` baste para reprodução.
-- `XGBClassifier` usa `tree_method="hist"` com `n_jobs=1` para garantir
-  reprodução exata dentro da mesma versão do XGBoost.
+  É o representante único da família GBDT — XGBoost foi removido da
+  matriz por limitações de memória no host de 16 GB durante multiclasse
+  (8 classes × histograma por feature estoura 15 GB em representações
+  esparsas). `plano_base.md` permite "LightGBM/XGBoost" como opções
+  intercambiáveis; ficamos com LightGBM.
 - `class_weight` fica em default (None). Balanceamento é escolha do
   experimento, não do builder.
 - `LogisticRegression` usa `lbfgs` (suporta binário e multiclasse — o
@@ -26,7 +29,6 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import LogisticRegression
 from sklearn.naive_bayes import ComplementNB, MultinomialNB
 from sklearn.svm import LinearSVC
-from xgboost import XGBClassifier
 
 SEED = 1
 
@@ -36,7 +38,6 @@ GEN1_CLASSIFIERS: tuple[str, ...] = (
     "multinomialnb",
     "complementnb",
     "lightgbm",
-    "xgboost",
 )
 
 
@@ -62,14 +63,6 @@ def build_classifier(name: str) -> ClassifierMixin:
             deterministic=True,
             force_col_wise=True,
             verbose=-1,
-        )
-    if name == "xgboost":
-        return XGBClassifier(
-            random_state=SEED,
-            tree_method="hist",
-            n_jobs=1,
-            verbosity=0,
-            eval_metric="logloss",
         )
     raise ValueError(
         f"Classificador desconhecido: {name!r}. Use um de {GEN1_CLASSIFIERS}."

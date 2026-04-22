@@ -10,7 +10,6 @@ from sklearn.base import is_classifier
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import LogisticRegression
 from sklearn.naive_bayes import ComplementNB, MultinomialNB
-from xgboost import XGBClassifier
 
 from ptbr_market.gen1_classical import GEN1_CLASSIFIERS, SEED, build_classifier
 
@@ -38,7 +37,6 @@ def test_gen1_classifiers_is_stable_tuple() -> None:
         "multinomialnb",
         "complementnb",
         "lightgbm",
-        "xgboost",
     )
 
 
@@ -73,10 +71,6 @@ def test_lightgbm_has_expected_type() -> None:
     assert isinstance(build_classifier("lightgbm"), LGBMClassifier)
 
 
-def test_xgboost_has_expected_type() -> None:
-    assert isinstance(build_classifier("xgboost"), XGBClassifier)
-
-
 @pytest.mark.parametrize("name", GEN1_CLASSIFIERS)
 def test_build_classifier_fits_and_predicts_proba(name: str) -> None:
     X, y = _toy_sparse_data()
@@ -98,7 +92,7 @@ def test_build_classifier_is_deterministic(name: str) -> None:
 
 def test_build_classifier_unknown_name_raises() -> None:
     with pytest.raises(ValueError, match="Classificador desconhecido"):
-        build_classifier("catboost")
+        build_classifier("xgboost")
 
 
 def test_build_classifier_unknown_name_lists_allowed() -> None:
