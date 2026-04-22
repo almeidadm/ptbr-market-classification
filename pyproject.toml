@@ -17,6 +17,18 @@ dev = [
     "pytest>=8",
     "ruff>=0.6",
 ]
+report = [
+    "ipykernel>=6",
+    "jupyter>=1",
+    "matplotlib>=3.9",
+    "nbconvert>=7",
+]
+gen2 = [
+    "accelerate>=0.30",
+    "datasets>=2.20",
+    "torch>=2.3",
+    "transformers>=4.40",
+]
 
 [build-system]
 requires = ["hatchling"]

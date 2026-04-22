@@ -18,6 +18,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
+
 ALLOWED_GENERATIONS: tuple[str, ...] = ("gen1", "gen2", "gen3", "ensemble")
 
 REQUIRED_METADATA_KEYS: tuple[str, ...] = (
@@ -143,6 +145,31 @@ def write_run_metadata(run_dir: Path, payload: dict[str, Any]) -> None:
 def write_metrics(run_dir: Path, metrics: dict[str, Any]) -> None:
     """Grava `metrics.json` — cópia redundante do bloco `metrics` do metadata."""
     _write_json(run_dir / "metrics.json", metrics)
+
+
+def load_splits() -> dict[str, pd.DataFrame]:
+    """Carrega `train|val|test.parquet` de `artifacts/splits/`."""
+    return {
+        name: pd.read_parquet(splits_dir() / f"{name}.parquet")
+        for name in ("train", "val", "test")
+    }
+
+
+def build_split_meta_block() -> dict[str, Any]:
+    """Extrai o bloco `split` canônico do `metadata.json` dos splits.
+
+    Usado como sub-bloco do `metadata.json` de cada run, para que todo run
+    declare exatamente sobre qual janela OoT foi avaliado.
+    """
+    meta = json.loads((splits_dir() / "metadata.json").read_text())
+    return {
+        "train_window": meta["split"]["train"]["window"],
+        "val_window": meta["split"]["val"]["window"],
+        "test_window": meta["split"]["test"]["window"],
+        "n_train": meta["split"]["train"]["n"],
+        "n_val": meta["split"]["val"]["n"],
+        "n_test": meta["split"]["test"]["n"],
+    }
 
 
 def write_predictions(

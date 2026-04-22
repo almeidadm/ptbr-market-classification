@@ -23,8 +23,6 @@ import argparse
 import json
 import sys
 
-import pandas as pd
-
 from ptbr_market import gen1_classical, gen1_pipeline, preprocessing, runs
 
 DEFAULT_VARIANT: str | None = None  # None = auto-deriva
@@ -107,25 +105,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def load_splits() -> dict[str, pd.DataFrame]:
-    return {
-        name: pd.read_parquet(runs.splits_dir() / f"{name}.parquet")
-        for name in ("train", "val", "test")
-    }
-
-
-def build_split_meta_block() -> dict:
-    meta = json.loads((runs.splits_dir() / "metadata.json").read_text())
-    return {
-        "train_window": meta["split"]["train"]["window"],
-        "val_window": meta["split"]["val"]["window"],
-        "test_window": meta["split"]["test"]["window"],
-        "n_train": meta["split"]["train"]["n"],
-        "n_val": meta["split"]["val"]["n"],
-        "n_test": meta["split"]["test"]["n"],
-    }
-
-
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     models = [m.strip() for m in args.models.split(",") if m.strip()]
@@ -151,8 +130,8 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     print("Carregando splits…", file=sys.stderr)
-    splits = load_splits()
-    split_meta_block = build_split_meta_block()
+    splits = runs.load_splits()
+    split_meta_block = runs.build_split_meta_block()
     for name, df in splits.items():
         print(f"  {name}: {len(df)} linhas", file=sys.stderr)
 
