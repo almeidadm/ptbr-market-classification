@@ -2585,6 +2585,10 @@ gen2 = [
     { name = "torch" },
     { name = "transformers" },
 ]
+gen3 = [
+    { name = "huggingface-hub" },
+    { name = "requests" },
+]
 report = [
     { name = "ipykernel" },
     { name = "jupyter" },
@@ -2612,6 +2616,10 @@ gen2 = [
     { name = "datasets", specifier = ">=2.20" },
     { name = "torch", specifier = ">=2.3" },
     { name = "transformers", specifier = ">=4.40" },
+]
+gen3 = [
+    { name = "huggingface-hub", specifier = ">=0.24" },
+    { name = "requests", specifier = ">=2.31" },
 ]
 report = [
     { name = "ipykernel", specifier = ">=6" },

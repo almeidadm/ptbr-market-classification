@@ -29,6 +29,10 @@ gen2 = [
     "torch>=2.3",
     "transformers>=4.40",
 ]
+gen3 = [
+    "requests>=2.31",
+    "huggingface-hub>=0.24",
+]
 
 [build-system]
 requires = ["hatchling"]
