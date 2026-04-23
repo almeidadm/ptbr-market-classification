@@ -94,13 +94,23 @@ _MC8_LABELS: tuple[str, ...] = (
 class HFGGUFSource:
     """Modelo GGUF hospedado no HuggingFace para importação no Ollama.
 
-    `repo_id` + `filename` endereçam um snapshot único. Modelos nativos do
-    Ollama (Llama 3.1, Qwen 2.5, Gemma 2) não precisam disso — vêm da
-    registry oficial.
+    Dois modos:
+
+    - `convert_from_safetensors=False` (default): `repo_id` aponta para um
+      repositório que já hospeda `.gguf` prontos. `filename` é o nome do
+      arquivo a baixar via `hf_hub_download`.
+    - `convert_from_safetensors=True`: `repo_id` aponta para o repositório
+      FP16 oficial (formato HuggingFace/safetensors). `filename` é o nome
+      de saída esperado **após conversão local** para Q4_K_M GGUF via
+      `llama.cpp` (`convert_hf_to_gguf.py` + `llama-quantize`).
+
+    Modelos nativos do Ollama (Llama 3.1, Qwen 2.5, Gemma 2) não precisam
+    disso — vêm da registry oficial.
     """
 
     repo_id: str
     filename: str
+    convert_from_safetensors: bool = False
     modelfile_template: str = (
         'FROM ./{filename}\nPARAMETER temperature 0\nPARAMETER stop "\\n"\n'
     )
@@ -158,8 +168,9 @@ GEN3_MODELS: dict[str, Gen3ModelSpec] = {
         ollama_model_tag="tucano-2b4-instruct:q4_k_m",
         bucket="ptbr-gguf",
         gguf_source=HFGGUFSource(
-            repo_id="tensorblock/Tucano-2b4-Instruct-GGUF",
-            filename="Tucano-2b4-Instruct-Q4_K_M.gguf",
+            repo_id="TucanoBR/Tucano-2b4-Instruct",
+            filename="tucano-2b4-instruct-q4_k_m.gguf",
+            convert_from_safetensors=True,
         ),
     ),
 }
