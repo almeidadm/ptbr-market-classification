@@ -1,0 +1,2 @@
+gen3_model,gen3_variant,gen3_target_tag,gen1,n_test,b_gen1_only_correct,c_gen3_only_correct,mcnemar_statistic,p_value,winner,significant_p_lt_0_05,gen3_f1_minority,gen1_f1_minority,delta_f1_minority
+llama3.1-8b,zs-v1-bin,bin,linearsvc__tfidf-aggr-mc8,16627,1833,285,1129.938149197356,1.0282001804156955e-247,gen1,True,0.0,0.8535506402793946,-0.8535506402793946

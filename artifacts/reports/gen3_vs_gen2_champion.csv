@@ -1,0 +1,2 @@
+gen3_model,gen3_variant,gen3_target_tag,gen2,n_test,b_gen2_only_correct,c_gen3_only_correct,mcnemar_statistic,p_value,winner,significant_p_lt_0_05,gen3_f1_minority,gen2_f1_minority,delta_f1_minority
+llama3.1-8b,zs-v1-bin,bin,bertimbau-base__raw-ml256-mc8,16627,1963,306,1208.6099603349494,8.205784549846389e-265,gen2,True,0.0,0.8830409356725146,-0.8830409356725146
