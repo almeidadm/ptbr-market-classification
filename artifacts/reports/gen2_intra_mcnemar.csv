@@ -1,0 +1,3 @@
+model,n_test,b_bin_only_correct,c_mc8_only_correct,mcnemar_statistic,p_value,winner,significant_p_lt_0_05
+bertimbau-base,16627,174,201,1.8026666666666666,0.1793904419231374,mc8,False
+finbert-ptbr,16627,172,229,7.820448877805486,0.005165836403304036,mc8,True
