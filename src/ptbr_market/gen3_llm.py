@@ -18,18 +18,25 @@ Convenções (decisões locked 2026-04-22):
   sobre os logprobs dos tokens das classes alvo; quando nenhum token-alvo
   aparece no top-k, cai para `y_score ∈ {0.0, 1.0}` a partir do hard label
   parseado. A contagem de quedas fica em `config.scoring.method_counts`.
-- **Sem threshold.** Gen 3 grava `threshold.applicable = False` — o recorte
-  é fixo em 0.5 (ou pelo hard label quando não há logprob). A decisão é
-  reportada como "zero-shot cru" no artigo; a comparação com Gen 1/Gen 2
-  usa PR-AUC (invariante a threshold) e F1-minority sobre o recorte padrão.
-- **Latência wall-clock por requisição**, agregada para `ms/1k`. VRAM pico
-  via amostragem `nvidia-smi` em thread daemon — o processo Ollama fica em
+- **Threshold calibrado em val, congelado em test** (mesma mecânica de
+  Gen 1/Gen 2). Gen 3 roda inferência sobre `splits["val"]` antes do test
+  para obter `y_score_val`; `threshold.fit_threshold` varre a grade
+  `[0,05, 0,95]` passo 0,01 com objetivo `f1_minority` e o valor
+  escolhido é aplicado ao `y_score_test` via `apply_threshold` para
+  materializar `y_pred`. `metadata.threshold.applicable = True`,
+  `fitted_on = "val"`.
+- **Latência wall-clock medida sobre val**, agregada para `ms/1k` —
+  alinhada com Gen 1/Gen 2 (a passada de val já é obrigatória para o
+  fit do threshold, então medir lá é gratuito). VRAM pico via
+  amostragem `nvidia-smi` em thread daemon — o processo Ollama fica em
   PID separado, então `torch.cuda.*` não enxerga esse consumo.
-- **Resumabilidade append-only.** `predictions.csv` é aberto em modo
-  append com `flush + os.fsync` por linha; reabrir o `run_dir` via
-  `--resume-run-id` pula os `index` já processados. Metadata só é gravado
-  no final (ou em `--dry-run`); runs incompletos deixam `predictions.csv`
-  legível mas sem `metadata.json` → fácil identificar e retomar.
+- **Resumabilidade append-only.** `predictions_val.csv` (val) e
+  `predictions.csv` (test) são abertos em modo append com
+  `flush + os.fsync` por linha; reabrir o `run_dir` via
+  `--resume-run-id` pula os `index` já processados em cada split
+  independentemente. Metadata só é gravado no final; runs incompletos
+  deixam os CSVs legíveis mas sem `metadata.json` → fácil identificar
+  e retomar.
 - **`seed=1`** onde faz sentido (ordem do dataset, `temperature=0.0` na
   API). A decodificação determinística do Ollama não é bit-exact entre
   versões do servidor — `config.ollama_model_tag` fixa a tag para auditoria.
@@ -61,7 +68,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-from ptbr_market import evaluation, preprocessing, runs, targets
+from ptbr_market import evaluation, preprocessing, runs, targets, threshold as thr_mod
 
 SEED = 1
 DEFAULT_NUM_CTX = 2048
@@ -545,6 +552,8 @@ class VRAMSampler(AbstractContextManager[Any]):
 
 
 _PRED_HEADER: tuple[str, ...] = ("index", "y_true", "y_pred", "y_score")
+_VAL_PRED_FILENAME = "predictions_val.csv"
+_TEST_PRED_FILENAME = "predictions.csv"
 
 
 def _read_processed_indices(path: Path) -> set[int]:
@@ -582,13 +591,121 @@ class _RunStats:
     label_counts: dict[str, int] = field(default_factory=dict)
 
 
-def _test_texts_for_prompt(split: pd.DataFrame) -> tuple[list[str], list[str]]:
+def _texts_for_prompt(split: pd.DataFrame) -> tuple[list[str], list[str]]:
     """Retorna (titles, texts) pré-normalizados NFC + strip, sem máscara."""
     titles = preprocessing.preprocess_raw(
         split["title"].tolist() if "title" in split.columns else ["" for _ in range(len(split))]
     )
     texts = preprocessing.preprocess_raw(split["text"].tolist())
     return titles, texts
+
+
+# Alias mantido por compatibilidade com código que já importava o nome antigo.
+_test_texts_for_prompt = _texts_for_prompt
+
+
+def _load_accumulated_rows(path: Path) -> list[tuple[int, int, int, float]]:
+    """Lê um `predictions*.csv` existente e devolve as linhas como tuplas."""
+    rows: list[tuple[int, int, int, float]] = []
+    if not path.exists():
+        return rows
+    with path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                rows.append(
+                    (
+                        int(row["index"]),
+                        int(row["y_true"]),
+                        int(row["y_pred"]),
+                        float(row["y_score"]),
+                    )
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+    return rows
+
+
+def _process_split(
+    *,
+    client: Any,
+    preds_path: Path,
+    titles: list[str],
+    texts: list[str],
+    indices: list[Any],
+    y_true_col: list[int],
+    n_items: int,
+    already_done: set[int],
+    stats: "_RunStats",
+    system_prompt: str,
+    user_template: str,
+    text_max_chars: int,
+    allowed_labels: tuple[str, ...],
+    positive_label: str,
+    vram: "VRAMSampler",
+    progress_every: int,
+    split_label: str,
+    spec_slug: str,
+    variant: str,
+    decision: "thr_mod.ThresholdDecision | None" = None,
+) -> list[tuple[int, int, int, float]]:
+    """Roda o cliente LLM sobre um split, grava predições append-only e devolve
+    todas as linhas (incluindo as reaproveitadas de um run anterior).
+
+    Se `decision` for não-None, `y_pred` gravado é derivado de
+    `apply_threshold(y_score, decision)`; caso contrário, é a saída
+    hard-label do parser (usado na passada de val, antes de saber a
+    threshold).
+    """
+    accumulated = _load_accumulated_rows(preds_path)
+
+    file_mode = "a" if preds_path.exists() else "w"
+    with preds_path.open(file_mode, encoding="utf-8", newline="") as fp:
+        writer = csv.writer(fp)
+        if file_mode == "w":
+            writer.writerow(list(_PRED_HEADER))
+            fp.flush()
+            os.fsync(fp.fileno())
+
+        for i in range(n_items):
+            idx = indices[i]
+            if idx in already_done:
+                continue
+            title_i = titles[i]
+            text_i = texts[i]
+            user_prompt = render_user_prompt(
+                user_template, title_i, text_i, text_max_chars
+            )
+            result = client.classify_one(
+                system=system_prompt,
+                user=user_prompt,
+                allowed_labels=allowed_labels,
+                positive_label=positive_label,
+            )
+            if decision is not None:
+                y_pred = int(1 if float(result.y_score) >= decision.value else 0)
+            else:
+                y_pred = int(result.y_pred)
+            row = (int(idx), int(y_true_col[i]), y_pred, float(result.y_score))
+            _append_prediction_row(fp, writer, row)
+            accumulated.append(row)
+            stats.n_processed += 1
+            stats.latencies_s.append(result.latency_s)
+            stats.method_counts[result.score_source] += 1
+            if result.matched_label is not None:
+                stats.label_counts[result.matched_label] = (
+                    stats.label_counts.get(result.matched_label, 0) + 1
+                )
+            if progress_every and stats.n_processed % progress_every == 0:
+                elapsed = sum(stats.latencies_s)
+                avg = elapsed / max(stats.n_processed, 1)
+                print(
+                    f"[gen3] {spec_slug} {variant} {split_label}: "
+                    f"{stats.n_processed}/{n_items - len(already_done)} "
+                    f"(avg {avg:.2f}s/req, VRAM peak {vram.peak_mb:.0f} MB)",
+                    flush=True,
+                )
+    return accumulated
 
 
 def run_gen3_experiment(
@@ -610,18 +727,33 @@ def run_gen3_experiment(
     progress_every: int = 200,
     client: OllamaClient | None = None,
 ) -> Path:
-    """Avalia um LLM zero-shot sobre `splits['test']` e persiste o run Gen 3.
+    """Avalia um LLM zero-shot sobre `splits['val']` + `splits['test']` e
+    persiste o run Gen 3.
 
     Retorna o `run_dir` criado em `artifacts/runs/{stamp}__gen3__{slug}__{variant}/`
     (ou `resume_run_dir` se fornecido).
+
+    Fluxo:
+
+    1. Inferência completa sobre `splits["val"]` → grava
+       `predictions_val.csv` (append-only, resumível).
+    2. `threshold.fit_threshold` sobre `(y_val_true, y_score_val)` com
+       objetivo `f1_minority` → `ThresholdDecision` congelada.
+    3. Inferência sobre `splits["test"]` → grava `predictions.csv` com
+       `y_pred = apply_threshold(y_score, decision)`.
+    4. Métricas (PR-AUC, F1-min, etc.) computadas só no test; latência
+       agregada sobre as requisições de val (alinhada com Gen 1/Gen 2,
+       que também medem na passada de val).
 
     Em `target_mode="binary"` o prompt limita a saída a `mercado|outros`;
     em `"multiclass"` limita à lista do `collapse_scheme` (atualmente
     sempre `top7_plus_other` → 8 rótulos). Em ambos os casos, a avaliação
     continua binária: `y_true` vem do rótulo binário do split, e o
-    `y_pred` derivado do LLM é 1 sse a classe escolhida for `mercado`.
+    `y_score` do LLM é renormalizado entre os tokens-alvo (PA-004).
 
-    `limit` é só para smoke-test — produz um run incompleto se < len(test).
+    `limit` é só para smoke-test — afeta só a fase de test (val é sempre
+    processado integralmente, caso contrário o fit de threshold não faz
+    sentido). Produz um run incompleto se `limit < len(test)`.
 
     `client` injetável para mock em testes; quando `None`, instancia um
     `OllamaClient` padrão sobre `ollama_host` e a tag do spec.
@@ -668,11 +800,18 @@ def run_gen3_experiment(
         allowed_labels = _MC8_LABELS
     positive_label = targets.POSITIVE_CATEGORY_LABEL
 
+    val = splits["val"]
     test = splits["test"]
-    titles, texts = _test_texts_for_prompt(test)
-    y_true = test["label"].astype(int).tolist()
+    val_titles, val_texts = _texts_for_prompt(val)
+    test_titles, test_texts = _texts_for_prompt(test)
+    y_val_true = val["label"].astype(int).tolist()
+    y_test_true = test["label"].astype(int).tolist()
+    val_indices = val.index.tolist()
     test_indices = test.index.tolist()
 
+    # `limit` é smoke-test: afeta só a fase de test. Val é sempre
+    # processado integralmente para garantir o fit do threshold.
+    n_val = len(val)
     n_test = len(test)
     if limit is not None:
         n_test = min(n_test, int(limit))
@@ -686,27 +825,10 @@ def run_gen3_experiment(
         run_dir = runs.new_run_dir("gen3", spec.slug, variant)
         started_at = runs.utc_now_iso()
 
-    preds_path = run_dir / "predictions.csv"
-    already_done = _read_processed_indices(preds_path)
-
-    # Carrega o que já foi gravado para poder agregar métricas no final sem
-    # reler o CSV duas vezes. Cada entrada: (index, y_true, y_pred, y_score).
-    accumulated_rows: list[tuple[int, int, int, float]] = []
-    if already_done:
-        with preds_path.open("r", encoding="utf-8", newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                try:
-                    accumulated_rows.append(
-                        (
-                            int(row["index"]),
-                            int(row["y_true"]),
-                            int(row["y_pred"]),
-                            float(row["y_score"]),
-                        )
-                    )
-                except (KeyError, TypeError, ValueError):
-                    continue
+    val_preds_path = run_dir / _VAL_PRED_FILENAME
+    test_preds_path = run_dir / _TEST_PRED_FILENAME
+    val_already_done = _read_processed_indices(val_preds_path)
+    test_already_done = _read_processed_indices(test_preds_path)
 
     if client is None:
         client = OllamaClient(
@@ -727,77 +849,116 @@ def run_gen3_experiment(
         warm_s = client.warmup()
         print(f"  [warmup] OK em {warm_s:.1f}s", flush=True)
 
-    stats = _RunStats(n_total=n_test, n_skipped_resume=len(already_done))
+    stats_val = _RunStats(n_total=n_val, n_skipped_resume=len(val_already_done))
+    stats_test = _RunStats(n_total=n_test, n_skipped_resume=len(test_already_done))
 
-    file_mode = "a" if preds_path.exists() else "w"
     with VRAMSampler() as vram:
-        with preds_path.open(file_mode, encoding="utf-8", newline="") as fp:
-            writer = csv.writer(fp)
-            if file_mode == "w":
-                writer.writerow(list(_PRED_HEADER))
-                fp.flush()
-                os.fsync(fp.fileno())
+        # Passada 1 — val. y_pred gravado é a hard-label do parser (a
+        # threshold ainda não existe); o fit a seguir consome só y_score.
+        val_rows = _process_split(
+            client=client,
+            preds_path=val_preds_path,
+            titles=val_titles,
+            texts=val_texts,
+            indices=val_indices,
+            y_true_col=y_val_true,
+            n_items=n_val,
+            already_done=val_already_done,
+            stats=stats_val,
+            system_prompt=system_prompt,
+            user_template=user_template,
+            text_max_chars=text_max_chars,
+            allowed_labels=allowed_labels,
+            positive_label=positive_label,
+            vram=vram,
+            progress_every=progress_every,
+            split_label="val",
+            spec_slug=spec.slug,
+            variant=variant,
+            decision=None,
+        )
 
-            for i in range(n_test):
-                idx = test_indices[i]
-                if idx in already_done:
-                    continue
-                title_i = titles[i]
-                text_i = texts[i]
-                user_prompt = render_user_prompt(
-                    user_template, title_i, text_i, text_max_chars
-                )
-                result = client.classify_one(
-                    system=system_prompt,
-                    user=user_prompt,
-                    allowed_labels=allowed_labels,
-                    positive_label=positive_label,
-                )
-                row = (int(idx), int(y_true[i]), int(result.y_pred), float(result.y_score))
-                _append_prediction_row(fp, writer, row)
-                accumulated_rows.append(row)
-                stats.n_processed += 1
-                stats.latencies_s.append(result.latency_s)
-                stats.method_counts[result.score_source] += 1
-                if result.matched_label is not None:
-                    stats.label_counts[result.matched_label] = (
-                        stats.label_counts.get(result.matched_label, 0) + 1
-                    )
-                if progress_every and stats.n_processed % progress_every == 0:
-                    elapsed = sum(stats.latencies_s)
-                    avg = elapsed / max(stats.n_processed, 1)
-                    print(
-                        f"[gen3] {spec.slug} {variant}: "
-                        f"{stats.n_processed}/{n_test - stats.n_skipped_resume} "
-                        f"(avg {avg:.2f}s/req, VRAM peak {vram.peak_mb:.0f} MB)",
-                        flush=True,
-                    )
+        if not val_rows:
+            raise RuntimeError(
+                "Nenhuma predição de val foi gerada; impossível calibrar"
+                " threshold. Verifique conectividade com Ollama."
+            )
 
+        val_rows_sorted = sorted(val_rows, key=lambda r: r[0])
+        y_val_true_sorted = [r[1] for r in val_rows_sorted]
+        y_val_score = [r[3] for r in val_rows_sorted]
+        decision = thr_mod.fit_threshold(
+            y_val_true_sorted,
+            y_val_score,
+            objective="f1_minority",
+        )
+        print(
+            f"[gen3] threshold calibrado em val: value={decision.value:.2f}"
+            f" objective={decision.objective}",
+            flush=True,
+        )
+
+        # Passada 2 — test. y_pred gravado já usa a threshold congelada.
+        test_rows = _process_split(
+            client=client,
+            preds_path=test_preds_path,
+            titles=test_titles,
+            texts=test_texts,
+            indices=test_indices,
+            y_true_col=y_test_true,
+            n_items=n_test,
+            already_done=test_already_done,
+            stats=stats_test,
+            system_prompt=system_prompt,
+            user_template=user_template,
+            text_max_chars=text_max_chars,
+            allowed_labels=allowed_labels,
+            positive_label=positive_label,
+            vram=vram,
+            progress_every=progress_every,
+            split_label="test",
+            spec_slug=spec.slug,
+            variant=variant,
+            decision=decision,
+        )
         vram_peak_mb = vram.peak_mb
 
     finished_at = runs.utc_now_iso()
 
-    # Agrega predictions e calcula métricas/efficiency sobre tudo que está
-    # gravado (inclui o que vinha do resume).
-    accumulated_rows.sort(key=lambda r: r[0])
-    y_true_col = [r[1] for r in accumulated_rows]
-    y_pred_col = [r[2] for r in accumulated_rows]
-    y_score_col = [r[3] for r in accumulated_rows]
-
-    if not accumulated_rows:
+    if not test_rows:
         raise RuntimeError(
-            "Nenhuma predição foi gerada; nada a avaliar. Verifique conectividade"
-            " com Ollama ou o valor de `limit`."
+            "Nenhuma predição de test foi gerada; nada a avaliar. Verifique"
+            " conectividade com Ollama ou o valor de `limit`."
         )
 
-    metrics = evaluation.compute_metrics(y_true_col, y_score_col, y_pred_col)
+    test_rows_sorted = sorted(test_rows, key=lambda r: r[0])
+    y_test_true_sorted = [r[1] for r in test_rows_sorted]
+    y_test_score = [r[3] for r in test_rows_sorted]
+    # Reaplica a threshold atual a TODOS os y_score do test — garante
+    # consistência se o run resumiu de uma versão antiga do predictions.csv.
+    y_test_pred = thr_mod.apply_threshold(y_test_score, decision).tolist()
 
-    total_latency_s = sum(stats.latencies_s)
+    metrics = evaluation.compute_metrics(
+        y_test_true_sorted, y_test_score, y_test_pred
+    )
+
+    # Latência medida sobre val (passada obrigatória e temporalmente
+    # adjacente ao test) — alinha com Gen 1/Gen 2, que também medem lá.
+    total_val_latency_s = sum(stats_val.latencies_s)
     latency_ms_per_1k = (
-        (total_latency_s * 1000.0 * 1000.0) / max(stats.n_processed, 1)
-        if stats.n_processed > 0
+        (total_val_latency_s * 1000.0 * 1000.0) / max(stats_val.n_processed, 1)
+        if stats_val.n_processed > 0
         else 0.0
     )
+
+    combined_method_counts = {
+        k: stats_val.method_counts[k] + stats_test.method_counts[k]
+        for k in stats_val.method_counts
+    }
+    combined_label_counts: dict[str, int] = {}
+    for sc in (stats_val, stats_test):
+        for k, v in sc.label_counts.items():
+            combined_label_counts[k] = combined_label_counts.get(k, 0) + v
 
     target_block: dict[str, Any]
     if target_mode == "binary":
@@ -847,13 +1008,17 @@ def run_gen3_experiment(
                 },
                 "scoring": {
                     "method": "logprobs_with_hard_fallback",
-                    "method_counts": stats.method_counts,
-                    "label_counts": stats.label_counts,
+                    "method_counts": combined_method_counts,
+                    "label_counts": combined_label_counts,
+                    "method_counts_val": dict(stats_val.method_counts),
+                    "method_counts_test": dict(stats_test.method_counts),
                 },
                 "resume": {
                     "resumed": resume_run_dir is not None,
-                    "n_skipped": stats.n_skipped_resume,
-                    "n_processed_this_run": stats.n_processed,
+                    "n_skipped": stats_test.n_skipped_resume,
+                    "n_processed_this_run": stats_test.n_processed,
+                    "n_skipped_val": stats_val.n_skipped_resume,
+                    "n_processed_val_this_run": stats_val.n_processed,
                 },
                 "target": target_block,
                 "gguf_source": (
@@ -866,23 +1031,31 @@ def run_gen3_experiment(
                 ),
             },
             "split": split_meta_block,
-            # Gen 3 é zero-shot cru: não há calibração em val. O cutoff fica
-            # fixo em 0.5 (ou no hard label) e aparece aqui apenas para
-            # manter o schema. Comparações com Gen 1/Gen 2 usam PR-AUC
-            # (invariante) e F1-minority sobre esse recorte.
+            # Threshold calibrado sobre `y_score_val` via
+            # `ptbr_market.threshold.fit_threshold` (grade [0,05, 0,95]
+            # passo 0,01, objetivo f1_minority). Valor congelado e
+            # aplicado ao test — mesma mecânica de Gen 1/Gen 2. O campo
+            # `applicable` permanece no schema Gen 3 para continuidade
+            # com runs legacy; `applicable=True` indica calibração
+            # efetiva.
             "threshold": {
-                "applicable": False,
-                "fitted_on": None,
-                "value": 0.5,
-                "objective": None,
+                "applicable": True,
+                "fitted_on": decision.fitted_on,
+                "value": decision.value,
+                "objective": decision.objective,
             },
             "metrics": metrics,
             "efficiency": {
                 "latency_ms_per_1k": latency_ms_per_1k,
+                "latency_measured_on": "val",
                 "latency_includes_tokenization": True,
                 "vram_peak_mb": vram_peak_mb,
-                "n_processed": stats.n_processed,
-                "n_total": stats.n_total,
+                "n_processed": stats_val.n_processed + stats_test.n_processed,
+                "n_total": n_val + n_test,
+                "n_processed_val": stats_val.n_processed,
+                "n_total_val": n_val,
+                "n_processed_test": stats_test.n_processed,
+                "n_total_test": n_test,
             },
         },
     )

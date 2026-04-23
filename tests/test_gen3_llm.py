@@ -51,10 +51,24 @@ def tiny_binary_splits() -> dict[str, pd.DataFrame]:
     ]
 
     def make(n_pos: int, n_neg: int, start_idx: int) -> pd.DataFrame:
-        titles = market_titles[:n_pos] + other_titles[:n_neg]
-        texts = market_texts[:n_pos] + other_texts[:n_neg]
-        labels = [1] * n_pos + [0] * n_neg
-        df = pd.DataFrame({"title": titles, "text": texts, "label": labels})
+        # Intercala pos/neg para que qualquer fatiamento inicial (ex.: via
+        # --limit para smoke) contenha as duas classes — caso contrário
+        # `compute_metrics` (ROC-AUC) quebra em y_true de classe única.
+        titles_list: list[str] = []
+        texts_list: list[str] = []
+        labels_list: list[int] = []
+        for i in range(max(n_pos, n_neg)):
+            if i < n_pos:
+                titles_list.append(market_titles[i])
+                texts_list.append(market_texts[i])
+                labels_list.append(1)
+            if i < n_neg:
+                titles_list.append(other_titles[i])
+                texts_list.append(other_texts[i])
+                labels_list.append(0)
+        df = pd.DataFrame(
+            {"title": titles_list, "text": texts_list, "label": labels_list}
+        )
         df.index = range(start_idx, start_idx + len(df))
         return df
 
@@ -283,7 +297,10 @@ def test_run_gen3_experiment_writes_complete_run_dir(
     assert (run_dir / "metadata.json").is_file()
     assert (run_dir / "metrics.json").is_file()
     assert (run_dir / "predictions.csv").is_file()
-    assert fake.calls == len(tiny_binary_splits["test"])
+    assert (run_dir / "predictions_val.csv").is_file()
+    # Agora o pipeline roda val + test (val para calibrar threshold).
+    expected_calls = len(tiny_binary_splits["val"]) + len(tiny_binary_splits["test"])
+    assert fake.calls == expected_calls
 
 
 def test_run_gen3_metadata_schema_and_config(
@@ -311,11 +328,14 @@ def test_run_gen3_metadata_schema_and_config(
     assert meta["config"]["prompt"]["target_tag"] == "bin"
     assert len(meta["config"]["prompt"]["hash"]) == 16
     assert meta["config"]["scoring"]["method"] == "logprobs_with_hard_fallback"
+    # method_counts combina val + test
     assert meta["config"]["scoring"]["method_counts"]["logprobs"] == fake.calls
     assert meta["config"]["target"]["mode"] == "binary"
-    # Gen 3 não tem threshold
-    assert meta["threshold"]["applicable"] is False
-    assert meta["threshold"]["fitted_on"] is None
+    # Threshold calibrado em val (mesma mecânica de Gen 1/Gen 2)
+    assert meta["threshold"]["applicable"] is True
+    assert meta["threshold"]["fitted_on"] == "val"
+    assert meta["threshold"]["objective"] == "f1_minority"
+    assert 0.05 <= meta["threshold"]["value"] <= 0.95
 
 
 def test_run_gen3_predictions_are_binary_and_aligned(
@@ -378,12 +398,14 @@ def test_run_gen3_resume_skips_processed_indices(
     split_meta_block: dict,
     isolated_artifacts: Path,
 ) -> None:
-    """Run parcial via `limit`, depois retoma sobre o mesmo run_dir."""
+    """Run parcial via `limit`, depois retoma sobre o mesmo run_dir.
+
+    `limit` só afeta a fase de test (val é sempre processado integralmente
+    para permitir fit do threshold).
+    """
     fake1 = FakeOllamaClient()
-    # Passe 1: primeiras 3 amostras de um test de 6.
-    # Como `run_gen3_experiment` sempre escreve metadata ao final, o primeiro
-    # `limit` já produz run completo — re-executamos com resume para
-    # confirmar que a retomada respeita os índices.
+    n_val = len(tiny_binary_splits["val"])
+    # Passe 1: val completo (4) + 3 primeiras de test (limit=3) = 7 chamadas.
     run_dir = gen3_llm.run_gen3_experiment(
         splits=tiny_binary_splits,
         split_meta_block=split_meta_block,
@@ -391,9 +413,9 @@ def test_run_gen3_resume_skips_processed_indices(
         limit=3,
         client=fake1,
     )
-    assert fake1.calls == 3
-    # Passe 2: retoma o mesmo run_dir. Fake zera contador — deve processar
-    # apenas as 3 amostras restantes.
+    assert fake1.calls == n_val + 3
+    # Passe 2: retoma o mesmo run_dir sem limit. Val já processado → 0
+    # calls; test tem 3 done, 3 faltando → 3 calls. Total: 3.
     fake2 = FakeOllamaClient()
     run_dir2 = gen3_llm.run_gen3_experiment(
         splits=tiny_binary_splits,
@@ -403,13 +425,18 @@ def test_run_gen3_resume_skips_processed_indices(
         client=fake2,
     )
     assert run_dir2 == run_dir
-    assert fake2.calls == 3  # só as que faltavam
+    assert fake2.calls == 3  # só as que faltavam de test; val já estava feito
     meta = json.loads((run_dir / "metadata.json").read_text())
     assert meta["config"]["resume"]["resumed"] is True
     assert meta["config"]["resume"]["n_skipped"] == 3
     assert meta["config"]["resume"]["n_processed_this_run"] == 3
+    # Val completamente pulado na 2ª passada
+    assert meta["config"]["resume"]["n_skipped_val"] == n_val
+    assert meta["config"]["resume"]["n_processed_val_this_run"] == 0
     preds = pd.read_csv(run_dir / "predictions.csv")
     assert len(preds) == len(tiny_binary_splits["test"])
+    val_preds = pd.read_csv(run_dir / "predictions_val.csv")
+    assert len(val_preds) == n_val
 
 
 def test_run_gen3_rejects_unknown_model(
@@ -490,8 +517,12 @@ def test_run_gen3_efficiency_block(
     meta = json.loads((run_dir / "metadata.json").read_text())
     eff = meta["efficiency"]
     assert eff["latency_includes_tokenization"] is True
+    assert eff["latency_measured_on"] == "val"
     assert eff["latency_ms_per_1k"] > 0
+    # n_processed combinado (val + test) bate com o total de chamadas
     assert eff["n_processed"] == fake.calls
+    assert eff["n_processed_val"] == len(tiny_binary_splits["val"])
+    assert eff["n_processed_test"] == len(tiny_binary_splits["test"])
     assert "vram_peak_mb" in eff
 
 
