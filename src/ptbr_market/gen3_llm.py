@@ -397,6 +397,22 @@ class OllamaClient:
             "options": {"num_ctx": self.num_ctx, "seed": SEED},
         }
 
+    def warmup(self, timeout_s: float = 300.0) -> float:
+        """Força o load do modelo na VRAM via uma chamada minimal.
+
+        A primeira inferência paga ~30-90 s (load dos pesos no T4 para
+        modelos 7B-8B Q4_K_M; mais para Qwen 14B). O `timeout_s` padrão de
+        `classify_one` (60 s) é insuficiente para esse cold-start, então o
+        warmup roda separado com timeout grande, antes do loop de avaliação,
+        e fora da contagem de `latencies_s`. Retorna o tempo de warmup em
+        segundos para log/diagnóstico.
+        """
+        payload = self._payload("ok", "ok")
+        payload["max_tokens"] = 1
+        t0 = time.perf_counter()
+        requests.post(self._endpoint, json=payload, timeout=timeout_s).raise_for_status()
+        return time.perf_counter() - t0
+
     def classify_one(
         self,
         system: str,
@@ -701,6 +717,15 @@ def run_gen3_experiment(
             top_logprobs=top_logprobs,
             timeout_s=timeout_s,
         )
+
+    if hasattr(client, "warmup"):
+        print(
+            f"  [warmup] carregando {spec.ollama_model_tag} na VRAM"
+            " (até 300s, fora da contagem de latência)...",
+            flush=True,
+        )
+        warm_s = client.warmup()
+        print(f"  [warmup] OK em {warm_s:.1f}s", flush=True)
 
     stats = _RunStats(n_total=n_test, n_skipped_resume=len(already_done))
 
